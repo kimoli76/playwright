@@ -190,10 +190,20 @@ export function configFromCLIOptions(cliOptions: CLIOptions): Config & { configF
   if (cliOptions.sandbox !== undefined)
     launchOptions.chromiumSandbox = cliOptions.sandbox;
 
+  // -- [新增] 提取代理账密，配合 CDP 拦截逻辑 --
   if (cliOptions.proxyServer) {
-    launchOptions.proxy = {
-      server: cliOptions.proxyServer
-    };
+    launchOptions.proxy = { server: cliOptions.proxyServer };
+    try {
+      const proxyUrl = new URL(cliOptions.proxyServer);
+      if (proxyUrl.username || proxyUrl.password) {
+        launchOptions.proxy.server = `${proxyUrl.protocol}//${proxyUrl.host}`;
+        launchOptions.proxy.username = decodeURIComponent(proxyUrl.username);
+        launchOptions.proxy.password = decodeURIComponent(proxyUrl.password);
+      }
+    } catch {
+      // Fallback to raw string if invalid URL format
+    }
+
     if (cliOptions.proxyBypass)
       launchOptions.proxy.bypass = cliOptions.proxyBypass;
   }

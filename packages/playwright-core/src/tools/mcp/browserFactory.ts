@@ -74,6 +74,79 @@ export interface BrowserContextFactory {
   createContext(clientInfo: ClientInfo): Promise<playwright.BrowserContext>;
 }
 
+// =====================================================================
+// [新增功能]: CDP 拦截器配置函数
+// 作用：通过 Chrome DevTools Protocol (CDP) 在底层接管网络请求。
+// 实现了两个核心能力：
+// 1. 代理服务器的自动静默鉴权（免弹窗输入账号密码）。
+// 2. 根据 config.network.blockedOrigins 拦截并丢弃不合规的网络请求。
+// =====================================================================
+export async function setupCDPInterception(context: playwright.BrowserContext, config: FullConfig) {
+  // 从配置中提取代理信息 (username, password) 和需要拦截的域名列表
+  const proxyConfig = config.browser.launchOptions?.proxy as any;
+  const blockedOrigins = config.network?.blockedOrigins || [];
+
+  const attachInterceptor = async (page: playwright.Page) => {
+    try {
+      const cdpSession = await context.newCDPSession(page);
+      
+      // [新增]: 启用 CDP 的 Fetch 域
+      // handleAuthRequests: 允许我们接管 401/407 的鉴权请求
+      // patterns: 设置网络请求在发出的 'Request' 阶段就暂停，等待我们处理
+      await cdpSession.send('Fetch.enable', { 
+        handleAuthRequests: true,
+        patterns: [{ requestStage: 'Request' }]
+      });
+
+      // [新增]: 监听需要鉴权的事件 (例如 HTTP 407 代理验证)
+      cdpSession.on('Fetch.authRequired', async event => {
+        const isProxy = event.authChallenge.source === 'Proxy';
+        
+        // 自动填入 proxyConfig 中解析出来的账号密码
+        await cdpSession.send('Fetch.continueWithAuth', {
+          requestId: event.requestId,
+          authChallengeResponse: isProxy ? {
+            response: 'ProvideCredentials',
+            username: proxyConfig?.username || '',
+            password: proxyConfig?.password || '',
+          } : {
+            response: 'Default' // 如果不是代理鉴权（如普通的网页 401），则走默认行为
+          }
+        }).catch(() => {});
+      });
+
+      // [新增]: 监听被暂停的普通网络请求
+      cdpSession.on('Fetch.requestPaused', async event => {
+        const requestUrl = event.request.url;
+
+        // 检查当前请求的 URL 是否命中了我们配置的黑名单 (blockedOrigins)
+        const shouldBlock = blockedOrigins.some((origin: string) => requestUrl.includes(origin));
+        if (shouldBlock) {
+          // 如果命中黑名单，直接在底层让这个请求失败，前端会看到 (Blocked by Client)
+          await cdpSession.send('Fetch.failRequest', {
+            requestId: event.requestId,
+            errorReason: 'BlockedByClient'
+          }).catch(() => {});
+          return; // 终止函数，不再放行
+        }
+
+        // 如果一切正常，没有命中黑名单，则放行该请求让浏览器继续加载
+        await cdpSession.send('Fetch.continueRequest', {
+          requestId: event.requestId,
+        }).catch(() => {});
+      });
+
+    } catch {
+      // Ignore session creation failures on detached pages
+    }
+  };
+
+  // 为当前已有页面绑定 CDP 拦截器
+  context.on('page', attachInterceptor);
+  // 为未来可能打开的所有新页面绑定 CDP 拦截器
+  await Promise.all(context.pages().map(attachInterceptor));
+}
+
 function browserInfo(browser: playwright.Browser, config: FullConfig): BrowserInfo {
   return {
     // eslint-disable-next-line no-restricted-syntax
@@ -159,6 +232,14 @@ async function createPersistentBrowser(config: FullConfig, clientInfo: ClientInf
   };
   try {
     const browserContext = await browserType.launchPersistentContext(userDataDir, launchOptions);
+    
+    // =====================================================================
+    // [新增]: 挂载 CDP 拦截器
+    // 在浏览器上下文 (BrowserContext) 创建成功后，立刻调用 setupCDPInterception，
+    // 把代理配置和黑名单配置注入进去，确保在加载任何网页前就生效。
+    // =====================================================================
+    await setupCDPInterception(browserContext, config);
+
     const browser = browserContext.browser()!;
     await startServer(browser, clientInfo);
     return browser;
